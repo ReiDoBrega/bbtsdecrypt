@@ -78,11 +78,9 @@ func (p *Progress) Update(done int64) {
 	pct := float64(done) / float64(p.total) * 100.0
 	filled := int(int64(p.width) * done / p.total)
 
-	// Barra verde
 	filledBar := ColorGreen + strings.Repeat("█", filled) + ColorReset
 	emptyBar := strings.Repeat("░", p.width-filled)
 
-	// Calcular ETA
 	elapsed := now.Sub(p.startTime).Seconds()
 	var etaStr string
 	if done > 0 && elapsed > 0 {
@@ -357,12 +355,13 @@ func findStreamType(streams []StreamInfo, pid uint16) byte {
 	return 0
 }
 
-// Encryption state
 type EncState struct {
 	aesECBUser cipher.Block
-	ivec       []byte
-	ready      bool
-	mu         sync.Mutex
+	// ivec holds the BASE IV for the current segment (from SDT).
+	// It must NOT be mutated during decryption — a copy is made per-PES.
+	ivec  []byte
+	ready bool
+	mu    sync.Mutex
 }
 
 // PES Header Chunk
@@ -371,8 +370,10 @@ type PESHeaderChunk struct {
 	headerSize  int
 }
 
-// Decrypt ES with emulation removal
-func decryptESSparseWithEmulationRemoval(es []byte, state *EncState) {
+// decryptESSparseWithEmulationRemoval decrypts the Elementary Stream bytes in-place.
+// It receives a COPY of the base IV (ivStart) so it never mutates the state IV.
+func decryptESSparseWithEmulationRemoval(es []byte, block cipher.Block, ivStart []byte) {
+	// Remove emulation prevention bytes (0x00 0x00 0x03 → 0x00 0x00)
 	newES := make([]byte, 0, len(es))
 	i := 0
 	for i < len(es) {
@@ -385,8 +386,9 @@ func decryptESSparseWithEmulationRemoval(es []byte, state *EncState) {
 		}
 	}
 
+	// Work on a local counter copy so the caller's IV is never touched
 	iv := make([]byte, 16)
-	copy(iv, state.ivec)
+	copy(iv, ivStart)
 
 	esLen := len(newES)
 	pos := 0
@@ -398,7 +400,7 @@ func decryptESSparseWithEmulationRemoval(es []byte, state *EncState) {
 		copy(tmp, iv)
 
 		if esLen <= 16 || counter%10 == 0 {
-			state.aesECBUser.Encrypt(tmp, tmp)
+			block.Encrypt(tmp, tmp)
 		}
 
 		decLen := 16
@@ -415,6 +417,7 @@ func decryptESSparseWithEmulationRemoval(es []byte, state *EncState) {
 		counter++
 	}
 
+	// Re-insert emulation prevention bytes if sizes differ - FIX
 	if len(newES) != len(es) {
 		diff := len(es) - len(newES)
 		if diff > 0 {
@@ -424,8 +427,11 @@ func decryptESSparseWithEmulationRemoval(es []byte, state *EncState) {
 	copy(es, newES)
 }
 
-// Decrypt PES normal
-func decryptPESNormal(pes []byte, streamType byte, state *EncState) {
+// decryptPESNormal decrypts a full PES packet in-place using a snapshot of the
+// current segment IV.  The snapshot is taken once per call so that processing
+// multiple PES units within the same segment all start from the same base IV,
+// exactly as they would when each .bbts file is decrypted independently.
+func decryptPESNormal(pes []byte, streamType byte, block cipher.Block, ivSnap []byte) {
 	if len(pes) < 9 {
 		return
 	}
@@ -455,7 +461,7 @@ func decryptPESNormal(pes []byte, streamType byte, state *EncState) {
 				esCopy := make([]byte, len(es))
 				copy(esCopy, es)
 				if len(esCopy) > 0 {
-					decryptESSparseWithEmulationRemoval(esCopy, state)
+					decryptESSparseWithEmulationRemoval(esCopy, block, ivSnap)
 				}
 				newPES = append(newPES, esCopy...)
 				newPES = append(newPES, pes[len(pes)-2:]...)
@@ -478,7 +484,7 @@ func decryptPESNormal(pes []byte, streamType byte, state *EncState) {
 						}
 
 						if len(es) > 0 {
-							decryptESSparseWithEmulationRemoval(es, state)
+							decryptESSparseWithEmulationRemoval(es, block, ivSnap)
 						}
 						newPES = append(newPES, es...)
 
@@ -525,6 +531,11 @@ func decryptBBTSToTSFile(bbtsPath, outTSPath, userKeyHex string, noAudio, noVide
 	var pesHeaders []PESHeaderChunk
 	lastPID := uint16(0xFFFF)
 
+	// ivSnapForPES holds a frozen copy of the IV at the moment the PES started.
+	// Each new PES unit captures the current segment IV so that decryption is
+	// independent and deterministic regardless of how many PES units came before.
+	var ivSnapForPES []byte
+
 	fin, err := os.Open(bbtsPath)
 	if err != nil {
 		return err
@@ -541,6 +552,7 @@ func decryptBBTSToTSFile(bbtsPath, outTSPath, userKeyHex string, noAudio, noVide
 		if len(pes) == 0 || len(pesHeaders) == 0 || !state.ready {
 			pes = nil
 			pesHeaders = nil
+			ivSnapForPES = nil
 			lastPID = 0xFFFF
 			return nil
 		}
@@ -550,25 +562,97 @@ func decryptBBTSToTSFile(bbtsPath, outTSPath, userKeyHex string, noAudio, noVide
 			sidPrev = pes[3]
 		}
 
-		if sidPrev == 0xE0 && len(pes) > 8 {
+		if sidPrev == 0xE0 && len(pes) > 8 && ivSnapForPES != nil {
 			streamType := findStreamType(pmtStreams, lastPID)
-			decryptPESNormal(pes, streamType, state)
+			decryptPESNormal(pes, streamType, state.aesECBUser, ivSnapForPES)
 		}
 
-		pos := 0
-		for _, h := range pesHeaders {
-			fout.Write(h.headerBytes)
-			payloadSize := TS_PKT - h.headerSize
-			if pos+payloadSize > len(pes) {
-				fout.Write(pes[pos:])
+		// Reconstruct TS packets preserving the EXACT original packet layout.
+		// Each header chunk knows precisely how many payload bytes it carried,
+		// so we copy exactly that many bytes from the PES buffer — no more, no
+		// less.  This prevents DTS/PTS corruption caused by size miscalculation.
+		pesRemain := len(pes)
+		pesPos := 0
+		for i, h := range pesHeaders {
+			// Payload capacity = 188 - header_size, but the last packet of the
+			// PES may have had stuffing bytes already embedded in the original
+			// adaptation field.  We MUST write exactly 188 bytes per packet.
+			payloadCap := TS_PKT - h.headerSize
+
+			var payload []byte
+			if pesRemain <= 0 {
+				// No more PES data; fill with stuffing (0xFF) :D
+				payload = make([]byte, payloadCap)
+				for k := range payload {
+					payload[k] = 0xFF
+				}
+			} else if pesRemain < payloadCap {
+				// Last packet: not enough data to fill the slot.
+				// We must pad to keep the TS packet exactly 188 bytes.
+				// Only valid for the last header chunk.
+				if i == len(pesHeaders)-1 {
+					// Insert stuffing via adaptation field in the header copy.
+					hdr := make([]byte, h.headerSize)
+					copy(hdr, h.headerBytes)
+
+					stuffingNeeded := payloadCap - pesRemain
+
+					afc := int((hdr[3] >> 4) & 0x3)
+					if afc == 1 {
+						// No adaptation field yet — switch to AFC=3 and add one
+						hdr[3] = (hdr[3] & 0x0F) | 0x30 // set AFC bits to 3
+						if stuffingNeeded == 1 {
+							// Minimal: 1 byte adaptation field length = 0
+							// Shift payload start by 1 → need to prepend 1 byte
+							hdr = append(hdr, 0x00) // adaptation_field_length = 0
+						} else {
+							// adaptation_field_length = stuffingNeeded-1,
+							// then (stuffingNeeded-2) stuffing bytes (0xFF)
+							// after 1 flag byte (0x00)
+							hdr = append(hdr, byte(stuffingNeeded-1))
+							hdr = append(hdr, 0x00) // flags byte
+							for s := 0; s < stuffingNeeded-2; s++ {
+								hdr = append(hdr, 0xFF)
+							}
+						}
+					} else if afc == 3 {
+						// Already has an adaptation field — extend it
+						afLen := int(hdr[4])
+						extra := stuffingNeeded
+						hdr[4] = byte(afLen + extra)
+						// Insert stuffing bytes right after the existing AF
+						newHdr := make([]byte, 0, len(hdr)+extra)
+						newHdr = append(newHdr, hdr[:5+afLen]...)
+						for s := 0; s < extra; s++ {
+							newHdr = append(newHdr, 0xFF)
+						}
+						newHdr = append(newHdr, hdr[5+afLen:]...)
+						hdr = newHdr
+					}
+
+					fout.Write(hdr)
+					fout.Write(pes[pesPos : pesPos+pesRemain])
+					pesPos += pesRemain
+					pesRemain = 0
+					continue
+				}
+				// Not last packet and we ran out of data — write what we have
+				payload = pes[pesPos : pesPos+pesRemain]
+				pesPos += pesRemain
+				pesRemain = 0
 			} else {
-				fout.Write(pes[pos : pos+payloadSize])
+				payload = pes[pesPos : pesPos+payloadCap]
+				pesPos += payloadCap
+				pesRemain -= payloadCap
 			}
-			pos += payloadSize
+
+			fout.Write(h.headerBytes)
+			fout.Write(payload)
 		}
 
 		pes = nil
 		pesHeaders = nil
+		ivSnapForPES = nil
 		lastPID = 0xFFFF
 		return nil
 	}
@@ -577,22 +661,23 @@ func decryptBBTSToTSFile(bbtsPath, outTSPath, userKeyHex string, noAudio, noVide
 	done := int64(0)
 
 	for {
-		n, err := fin.Read(buf)
-		if n == 0 && err == io.EOF {
+		_, err := io.ReadFull(fin, buf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			flushPES()
 			break
 		}
-		if err != nil && err != io.EOF {
+		if err != nil {
 			return err
 		}
 
-		pkt := buf[:n]
-		done += int64(n)
+		pkt := make([]byte, TS_PKT)
+		copy(pkt, buf)
+		done += int64(TS_PKT)
 		if prog != nil {
 			prog.Update(done)
 		}
 
-		if len(pkt) != TS_PKT || pkt[0] != SYNC {
+		if pkt[0] != SYNC {
 			fout.Write(pkt)
 			continue
 		}
@@ -606,23 +691,30 @@ func decryptBBTSToTSFile(bbtsPath, outTSPath, userKeyHex string, noAudio, noVide
 		}
 
 		if pid == PID_SDT {
+			flushPES()
+
 			sec := sdtAsm.Push(pkt)
 			if sec != nil {
-				if parseSDTAndSetIV(sec, state.ivec) {
+				newIVec := make([]byte, 16)
+				if parseSDTAndSetIV(sec, newIVec) {
+					// Only update if the IV actually changed (new segment)
+					if !ivEqual(state.ivec, newIVec) {
+						copy(state.ivec, newIVec)
+						pmtStreams = nil
+					}
 					state.ready = true
 				}
 			}
-			flushPES()
 			fout.Write(pkt)
 			continue
 		}
 
 		if pid == PID_PMT {
+			flushPES()
 			sec := pmtAsm.Push(pkt)
 			if sec != nil && state.ready {
 				pmtStreams = parsePMTStreams(sec)
 			}
-			flushPES()
 			fout.Write(pkt)
 			continue
 		}
@@ -692,6 +784,11 @@ func decryptBBTSToTSFile(bbtsPath, outTSPath, userKeyHex string, noAudio, noVide
 			continue
 		}
 
+		if isNewPES {
+			ivSnapForPES = make([]byte, 16)
+			copy(ivSnapForPES, state.ivec)
+		}
+
 		if tsAFC(pkt) == 3 {
 			pes = append(pes, pkt[off:]...)
 			pesHeaders = append(pesHeaders, PESHeaderChunk{
@@ -712,9 +809,21 @@ func decryptBBTSToTSFile(bbtsPath, outTSPath, userKeyHex string, noAudio, noVide
 	return nil
 }
 
+func ivEqual(a, b []byte) bool {
+	if len(a) != 16 || len(b) != 16 {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func printHelp() {
-	fmt.Printf("%sBBTSDecrypt - Version 1.5%s\n", ColorBold, ColorReset)
-	fmt.Println("(c) 2025 @ReiDoBrega")
+	fmt.Printf("%sBBTSDecrypt - Version 1.6%s\n", ColorBold, ColorReset)
+	fmt.Println("(c) 2025-2026 @duck @ReiDoBrega")
 	fmt.Printf("usage: %s [options] <input.bbts> <output>\n\n", filepath.Base(os.Args[0]))
 	fmt.Println("Options are:")
 	fmt.Println("  --show-progress : show progress details during decryption")
